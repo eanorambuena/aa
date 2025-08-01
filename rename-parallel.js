@@ -3,275 +3,259 @@ import path from 'path'
 import pdfjs from 'pdfjs-dist/legacy/build/pdf.js'
 import Tesseract from 'tesseract.js'
 import pdf2pic from 'pdf2pic'
+import { processArguments } from './args-handler.js'
+import { loadProcessedRegistry, saveProcessedRegistry, getFileKey } from './file-registry.js'
+import './error-handler.js' // Inicializa manejo de errores automáticamente
+import { showProgress, clearProgress, showSummary, showFolderInfo } from './ui-utils.js'
+import { getUniqueFilename, getPDFFiles, ensureDirectoryExists } from './file-utils.js'
+
 const { getDocument } = pdfjs
 
+const MAX_CONCURRENT = 5 // Limitar la concurrencia para evitar sobrecarga del sistema
+
+let processedRegistry = new Set()
+let processedFilenames = new Set()
+let failedFiles = [] // Lista de archivos que fallaron en el procesamiento
+let totalFiles = 0
+let processedCount = 0
+
 // Obtener carpetas desde argumentos de línea de comandos
-const folders = process.argv.slice(2)
-const REGISTRY_FILE = './processed_files.json'
-const MAX_CONCURRENT = 5 // Límite de archivos procesando simultáneamente
+const folders = processArguments()
 
-// Validar que se proporcionaron carpetas
-if (folders.length === 0) {
-  console.error('❌ Error: Debes especificar al menos una carpeta como argumento')
-  console.log('📋 Uso: node rename-parallel.js <carpeta1> [carpeta2] [carpeta3] ...')
-  console.log('📋 Ejemplo: node rename-parallel.js ./EME ./ESERT')
-  process.exit(1)
+// Configuración de conversión PDF a imagen para OCR
+const PDF_TO_PIC_OPTIONS = {
+  density: 100,
+  saveFilename: "temp_page",
+  savePath: path.join(process.cwd(), 'temp'),
+  format: "png",
+  width: 1024,
+  height: 1448
 }
 
-// Validar que las carpetas existen
-for (const folder of folders) {
-  if (!fs.existsSync(folder)) {
-    console.error(`❌ Error: La carpeta "${folder}" no existe`)
-    process.exit(1)
+// RUT/C.I. válidos para Uruguay (números de 7-8 dígitos)
+const RUT_REGEX = /\b(\d{7,8})\b/g
+
+// Extraer identificador RUT/C.I. del texto (sin dígito verificador)
+function extractIdentifier(text) {
+  if (!text || text.trim().length === 0) return null
+  
+  const rutMatch = text.match(RUT_REGEX)
+  if (rutMatch) {
+    return rutMatch[0] // Primer match encontrado
   }
-  if (!fs.statSync(folder).isDirectory()) {
-    console.error(`❌ Error: "${folder}" no es una carpeta`)
-    process.exit(1)
-  }
-}
-
-console.log(`🎯 Carpetas a procesar: ${folders.join(', ')}`)
-
-// Cargar registro de archivos ya procesados
-function loadProcessedRegistry() {
-  try {
-    if (fs.existsSync(REGISTRY_FILE)) {
-      return new Set(JSON.parse(fs.readFileSync(REGISTRY_FILE, 'utf8')))
-    }
-  } catch (error) {
-    console.warn('⚠️ No se pudo cargar el registro de archivos procesados, empezando desde cero')
-  }
-  return new Set()
-}
-
-// Guardar registro de archivos procesados
-function saveProcessedRegistry(processedFiles) {
-  try {
-    fs.writeFileSync(REGISTRY_FILE, JSON.stringify([...processedFiles], null, 2))
-  } catch (error) {
-    console.warn('⚠️ No se pudo guardar el registro de archivos procesados:', error.message)
-  }
-}
-
-async function extractIdentifier(text) {
-  const ciMatch = text.match(/C\.I\.\s*(.*?)\s*-/)
-  if (ciMatch) return ciMatch[1].trim()
-
-  const rutMatch = text.match(/\b(\d{7,9})[-–](\d|k|K)\b/)
-  if (rutMatch) return rutMatch[1] // Solo el número principal, sin el dígito verificador
-
   return null
 }
 
-async function extractTextFromPDF(pdfPath) {
-  const data = new Uint8Array(fs.readFileSync(pdfPath))
-  const pdf = await getDocument({ data }).promise
+// Extraer texto usando PDF.js
+async function extractTextWithPDFJS(pdfPath) {
+  try {
+    const data = new Uint8Array(fs.readFileSync(pdfPath))
+    const pdf = await getDocument({ data }).promise
 
-  let fullText = ''
-  for (let i = 1; i <= pdf.numPages; i++) {
-    const page = await pdf.getPage(i)
-    const content = await page.getTextContent()
-    const text = content.items.map(item => item.str).join(' ')
-    fullText += text + '\n'
-  }
-
-  return fullText
-}
-
-// Función de OCR como fallback
-async function extractTextWithOCR(filePath) {
-    try {
-        const convert = pdf2pic.fromPath(filePath, {
-            density: 300,
-            saveFilename: "page",
-            savePath: "./temp",
-            format: "png",
-            width: 2000,
-            height: 2000
-        })
-        
-        const result = await convert(1, { responseType: "image" })
-        
-        const { data: { text } } = await Tesseract.recognize(result.path, 'spa+eng', {
-            logger: () => {} // Silenciar logs del OCR para la barra de progreso
-        })
-        
-        try {
-            fs.unlinkSync(result.path)
-        } catch (cleanupError) {
-            // Silenciar errores de limpieza
-        }
-        
-        return text.trim()
-    } catch (error) {
-        return ''
+    let fullText = ''
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i)
+      const content = await page.getTextContent()
+      const text = content.items.map(item => item.str).join(' ')
+      fullText += text + '\n'
     }
-}
 
-function getUniqueFilename(baseDir, baseName) {
-  let i = 2 // Empezar desde 2 para evitar (1)
-  let filename = `${baseName}.pdf`
-  let fullPath = path.join(baseDir, filename)
-
-  while (fs.existsSync(fullPath)) {
-    filename = `${baseName} (${i}).pdf`
-    fullPath = path.join(baseDir, filename)
-    i++
+    return fullText
+  } catch (error) {
+    return '' // En caso de error, devolver texto vacío
   }
-
-  return fullPath
 }
 
-// Procesar un solo archivo
-async function processFile(file, folderPath, processedFiles) {
-  const fullPath = path.join(folderPath, file)
-  const fileKey = `${folderPath}/${file}`
+// Extraer texto usando OCR como fallback
+async function extractTextWithOCR(pdfPath) {
+  try {
+    ensureDirectoryExists(PDF_TO_PIC_OPTIONS.savePath)
+    
+    const convert = pdf2pic.fromPath(pdfPath, PDF_TO_PIC_OPTIONS)
+    const result = await convert(1, { responseType: "image" })
+    
+    // Verificar que el archivo de imagen se creó correctamente
+    if (!result.path || !fs.existsSync(result.path)) {
+      return ''
+    }
+    
+    const { data: { text } } = await Tesseract.recognize(result.path, 'spa+eng', {
+      logger: () => {}, // Silenciar logs del OCR
+      errorHandler: () => {} // Silenciar errores del OCR
+    })
+    
+    // Limpiar archivo temporal
+    try {
+      fs.unlinkSync(result.path)
+    } catch (cleanupError) {
+      // Ignorar errores de limpieza
+    }
+    
+    return text.trim()
+  } catch (error) {
+    // Silenciar errores específicos de libpng y setThrew
+    if (!error.message.includes('libpng') && !error.message.includes('setThrew')) {
+      console.warn(`⚠️ OCR error for ${path.basename(pdfPath)}: ${error.message}`)
+    }
+    return '' // En caso de error, devolver texto vacío
+  }
+}
+
+// Procesar un archivo PDF individual  
+async function processFile(filePath) {
+  const stats = fs.statSync(filePath)
+  const fileKey = getFileKey(filePath, stats)
   
-  // Saltar si ya fue procesado
-  if (processedFiles.has(fileKey)) {
-    return { skipped: true, file, reason: 'Ya procesado' }
+  // Verificar si ya fue procesado
+  if (processedRegistry.has(fileKey)) {
+    processedCount++
+    return { processed: true, renamed: false, error: false }
   }
+
+  const fileName = path.basename(filePath)
+  showProgress(processedCount + 1, totalFiles, fileName)
 
   try {
     // Intentar extracción con PDF.js primero
-    const text = await extractTextFromPDF(fullPath)
-    let rawId = await extractIdentifier(text)
-    let id = rawId?.replace(/\D/g, '')
-
-    // Si no se encontró con PDF.js, intentar OCR
-    if (!id) {
-      const ocrText = await extractTextWithOCR(fullPath)
-      if (ocrText && ocrText.trim()) {
-        const ocrRawId = await extractIdentifier(ocrText)
-        id = ocrRawId?.replace(/\D/g, '')
+    let extractedText = await extractTextWithPDFJS(filePath)
+    let identifier = extractIdentifier(extractedText)
+    
+    // Si PDF.js no encuentra texto, usar OCR como fallback
+    if (!identifier && extractedText.trim().length < 50) {
+      try {
+        extractedText = await extractTextWithOCR(filePath)
+        identifier = extractIdentifier(extractedText)
+      } catch (ocrError) {
+        // Si OCR falla, continuar sin él
+        identifier = null
       }
     }
 
-    if (id) {
-      // Marcar como procesado
-      processedFiles.add(fileKey)
-      return { success: true, file, id, fullPath }
+    if (identifier) {
+      const directory = path.dirname(filePath)
+      const newFileName = `${identifier}.pdf`
+      const newPath = getUniqueFilename(directory, identifier, '.pdf')
+      
+      // Verificar que no renombre a un archivo que ya existe
+      if (processedFilenames.has(newFileName)) {
+        processedRegistry.add(fileKey)
+        processedCount++
+        failedFiles.push({ file: fileName, reason: 'Nombre duplicado' })
+        return { processed: true, renamed: false, error: false }
+      }
+
+      fs.renameSync(filePath, newPath)
+      processedFilenames.add(newFileName)
+      processedRegistry.add(fileKey)
+      processedCount++
+      return { processed: true, renamed: true, error: false }
     } else {
-      return { failed: true, file, reason: 'No se encontró RUT/C.I.' }
+      processedRegistry.add(fileKey)
+      processedCount++
+      failedFiles.push({ file: fileName, reason: 'No se encontró RUT válido' })
+      return { processed: true, renamed: false, error: false }
     }
   } catch (error) {
-    return { failed: true, file, reason: error.message }
+    processedCount++
+    failedFiles.push({ file: fileName, reason: `Error: ${error.message}` })
+    return { processed: true, renamed: false, error: true }
   }
 }
 
-// Mostrar barra de progreso
-function showProgress(completed, total, currentFile = '') {
-  const percentage = Math.round((completed / total) * 100)
-  const barLength = 30
-  const filledLength = Math.round((percentage / 100) * barLength)
-  const bar = '█'.repeat(filledLength) + '░'.repeat(barLength - filledLength)
-  
-  process.stdout.write(`\r📊 Progreso: [${bar}] ${percentage}% (${completed}/${total}) ${currentFile.slice(0, 30)}...`)
-}
-
+// Procesar todos los PDFs en una carpeta usando procesamiento en paralelo
 async function renamePDFsInFolder(folderPath) {
-  const allFiles = fs.readdirSync(folderPath).filter(f => f.toLowerCase().endsWith('.pdf'))
-  const processedFiles = loadProcessedRegistry()
+  const files = getPDFFiles(folderPath)
   
-  console.log(`\n🔄 Procesando carpeta: ${folderPath}`)
-  console.log(`📁 Total de archivos PDF: ${allFiles.length}`)
+  if (files.length === 0) {
+    console.log(`❌ No se encontraron archivos PDF en: ${folderPath}`)
+    return
+  }
+
+  // Cargar registro de archivos procesados
+  processedRegistry = loadProcessedRegistry()
   
-  // Filtrar archivos ya procesados
-  const pendingFiles = allFiles.filter(file => !processedFiles.has(`${folderPath}/${file}`))
-  console.log(`⏳ Archivos pendientes: ${pendingFiles.length}`)
+  // En la primera ejecución (registro vacío), procesar todos los archivos
+  // En ejecuciones posteriores, solo archivos no procesados
+  const pendingFiles = processedRegistry.size === 0 ? files : files.filter(file => {
+    const fullPath = path.join(folderPath, file)
+    const stats = fs.statSync(fullPath)
+    const fileKey = getFileKey(fullPath, stats)
+    return !processedRegistry.has(fileKey)
+  })
+
+  showFolderInfo(folderPath, files.length, pendingFiles.length)
   
   if (pendingFiles.length === 0) {
     console.log('✅ Todos los archivos ya fueron procesados')
     return
   }
+  
+  totalFiles = pendingFiles.length
+  processedCount = 0
+  failedFiles = [] // Reiniciar lista de archivos fallidos para esta carpeta
+  
+  let renamedCount = 0
+  let errorCount = 0
 
-  const rutMap = new Map()
-  let completed = 0
-  const total = pendingFiles.length
-
-  // Procesar archivos en lotes paralelos
+  // Procesar archivos en lotes para controlar la concurrencia
   for (let i = 0; i < pendingFiles.length; i += MAX_CONCURRENT) {
     const batch = pendingFiles.slice(i, i + MAX_CONCURRENT)
+    const promises = batch.map(file => processFile(path.join(folderPath, file)))
     
-    const promises = batch.map(file => {
-      showProgress(completed, total, file)
-      return processFile(file, folderPath, processedFiles)
-    })
-
     const results = await Promise.all(promises)
     
-    for (const result of results) {
-      completed++
-      showProgress(completed, total, result.file)
-      
-      if (result.success) {
-        const { id, file, fullPath } = result
-        if (!rutMap.has(id)) rutMap.set(id, [])
-        rutMap.get(id).push({ file, fullPath })
-      }
-    }
-    
-    // Guardar progreso cada lote
-    saveProcessedRegistry(processedFiles)
+    // Contar resultados
+    results.forEach(result => {
+      if (result.renamed) renamedCount++
+      if (result.error) errorCount++
+    })
   }
 
-  console.log('\n')
-  console.log(`✅ Procesamiento completado. Renombrando archivos...`)
-
-  // 2. Renombrar y mover según cantidad
-  let renamed = 0
-  let moved = 0
+  // Guardar registro actualizado
+  saveProcessedRegistry(processedRegistry)
   
-  for (const [id, items] of rutMap.entries()) {
-    if (items.length === 1) {
-      // único → renombrar directamente (sin sufijo)
-      const { file, fullPath } = items[0]
-      const targetPath = path.join(folderPath, `${id}.pdf`)
-
-      if (!fs.existsSync(targetPath)) {
-        fs.renameSync(fullPath, targetPath)
-        renamed++
-        console.log(`✅ ${file} → ${id}.pdf`)
-      } else {
-        const newPath = getUniqueFilename(folderPath, id)
-        fs.renameSync(fullPath, newPath)
-        renamed++
-        console.log(`⚠️ Renombrado con sufijo: ${file} → ${path.basename(newPath)}`)
-      }
-    } else {
-      // múltiples → crear carpeta por RUT
-      const targetDir = path.join(folderPath, id)
-      if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir)
-
-      for (const { file, fullPath } of items) {
-        const targetPath = getUniqueFilename(targetDir, id)
-        fs.renameSync(fullPath, targetPath)
-        moved++
-        console.log(`📁 ${file} → ${path.relative(folderPath, targetPath)}`)
-      }
-    }
+  // Mostrar resumen
+  showSummary(path.basename(folderPath), renamedCount, 0)
+  
+  // Mostrar archivos fallidos si los hay
+  if (failedFiles.length > 0) {
+    console.log(`\n❌ Archivos que no se pudieron procesar (${failedFiles.length}):`)
+    failedFiles.forEach((failed, index) => {
+      console.log(`   ${index + 1}. ${failed.file} - ${failed.reason}`)
+    })
   }
-  
-  console.log(`\n📈 Resumen de ${folderPath}:`)
-  console.log(`   - Archivos renombrados: ${renamed}`)
-  console.log(`   - Archivos movidos a carpetas: ${moved}`)
-  console.log(`   - Total procesados exitosamente: ${renamed + moved}`)
 }
 
-// Ejecutar en cada carpeta con manejo de errores
+// Función principal
 async function main() {
-  console.log('🚀 Iniciando procesamiento masivo de PDFs...')
+  console.log('🚀 Iniciando procesamiento de PDFs...')
   
-  for (const folder of folders) {
-    try {
-      await renamePDFsInFolder(folder)
-    } catch (error) {
-      console.error(`❌ Error procesando carpeta ${folder}:`, error.message)
-      console.log(`⚠️ Continuando con la siguiente carpeta...`)
+  // Silenciar errores específicos de libpng y setThrew
+  const originalConsoleError = console.error
+  console.error = (...args) => {
+    const message = args.join(' ')
+    if (message.includes('libpng error') || 
+        message.includes('missing function: setThrew') || 
+        message.includes('Aborted(-1)')) {
+      return // Silenciar estos errores específicos
     }
+    originalConsoleError.apply(console, args)
   }
   
-  console.log('\n🎉 ¡Procesamiento completo terminado!')
+  if (folders.length === 0) {
+    console.log('❌ No se especificaron carpetas válidas')
+    process.exit(1)
+  }
+
+  for (const folder of folders) {
+    await renamePDFsInFolder(folder)
+  }
+
+  console.log('✅ Procesamiento completado')
 }
 
-main().catch(console.error)
+// Ejecutar programa principal
+main().catch(error => {
+  console.error('❌ Error fatal:', error.message)
+  process.exit(1)
+})
