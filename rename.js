@@ -1,6 +1,8 @@
 import fs from 'fs'
 import path from 'path'
 import pdfjs from 'pdfjs-dist/legacy/build/pdf.js'
+import Tesseract from 'tesseract.js'
+import pdf2pic from 'pdf2pic'
 const { getDocument } = pdfjs
 
 const folders = []
@@ -10,7 +12,7 @@ async function extractIdentifier(text) {
   if (ciMatch) return ciMatch[1].trim()
 
   const rutMatch = text.match(/\b(\d{7,9})[-–](\d|k|K)\b/)
-  if (rutMatch) return `${rutMatch[1]}${rutMatch[2]}`
+  if (rutMatch) return rutMatch[1] // Solo el número principal, sin el dígito verificador
 
   return null
 }
@@ -28,6 +30,51 @@ async function extractTextFromPDF(pdfPath) {
   }
 
   return fullText
+}
+
+// Función de OCR como fallback
+async function extractTextWithOCR(filePath) {
+    try {
+        console.log(`Intentando OCR en ${path.basename(filePath)}...`)
+        
+        const convert = pdf2pic.fromPath(filePath, {
+            density: 300,
+            saveFilename: "page",
+            savePath: "./temp",
+            format: "png",
+            width: 2000,
+            height: 2000
+        })
+        
+        const result = await convert(1, { responseType: "image" })
+        
+        const { data: { text } } = await Tesseract.recognize(result.path, 'spa+eng', {
+            logger: m => {
+                if (m.status === 'recognizing text') {
+                    console.log(`OCR progreso: ${Math.round(m.progress * 100)}%`)
+                }
+            }
+        })
+        
+        try {
+            fs.unlinkSync(result.path)
+        } catch (cleanupError) {
+            console.warn('No se pudo limpiar archivo temporal:', cleanupError.message)
+        }
+        
+        return text.trim()
+    } catch (error) {
+        // Manejo específico para errores de imagen corrupta
+        if (error.message.includes('libpng error') || 
+            error.message.includes('CRC error') || 
+            error.message.includes('bad adaptive filter') ||
+            error.message.includes('Aborted(-1)')) {
+            console.error(`❌ Imagen PNG corrupta en ${path.basename(filePath)}:`, error.message)
+        } else {
+            console.error(`❌ Error en OCR para ${path.basename(filePath)}:`, error.message)
+        }
+        return ''
+    }
 }
 
 function getUniqueFilename(baseDir, baseName) {
@@ -51,16 +98,51 @@ async function renamePDFsInFolder(folderPath) {
 
   // 1. Agrupar por RUT
   for (const file of files) {
-    const fullPath = path.join(folderPath, file)
-    const text = await extractTextFromPDF(fullPath)
-    const rawId = await extractIdentifier(text)
-    const id = rawId?.replace(/\D/g, '')
+    try {
+      const fullPath = path.join(folderPath, file)
+      const text = await extractTextFromPDF(fullPath)
+      const rawId = await extractIdentifier(text)
+      const id = rawId?.replace(/\D/g, '')
 
-    if (id) {
-      if (!rutMap.has(id)) rutMap.set(id, [])
-      rutMap.get(id).push({ file, fullPath })
-    } else {
-      console.log(`⚠️ No se encontró C.I. ni RUT en: ${file}`)
+      if (id) {
+        if (!rutMap.has(id)) rutMap.set(id, [])
+        rutMap.get(id).push({ file, fullPath })
+      } else {
+        console.log(`⚠️ No se encontró C.I. ni RUT con PDF parser en: ${file}. Intentando OCR...`)
+        // Intentar OCR como fallback con manejo robusto de errores
+        try {
+          const ocrText = await extractTextWithOCR(fullPath)
+          if (ocrText && ocrText.trim()) {
+            const ocrRawId = await extractIdentifier(ocrText)
+            const ocrId = ocrRawId?.replace(/\D/g, '')
+            
+            if (ocrId) {
+              if (!rutMap.has(ocrId)) rutMap.set(ocrId, [])
+              rutMap.get(ocrId).push({ file, fullPath })
+              console.log(`✅ OCR encontró ID: ${ocrId} en ${file}`)
+            } else {
+              console.log(`⚠️ No se encontró C.I. ni RUT ni con OCR en: ${file}`)
+            }
+          } else {
+            console.log(`⚠️ OCR no pudo extraer texto de: ${file}`)
+          }
+        } catch (ocrError) {
+          // Capturar cualquier error del OCR
+          if (ocrError.message.includes('libpng error') || 
+              ocrError.message.includes('CRC error') || 
+              ocrError.message.includes('bad adaptive filter') ||
+              ocrError.message.includes('Aborted(-1)') ||
+              ocrError.message.includes('RuntimeError')) {
+            console.error(`❌ Archivo con imagen corrupta: ${file}`)
+          } else {
+            console.error(`❌ Error en OCR para ${file}:`, ocrError.message)
+          }
+          console.log(`⚠️ No se pudo procesar ${file} con ningún método`)
+        }
+      }
+    } catch (fileError) {
+      console.error(`❌ Error procesando archivo ${file}:`, fileError.message)
+      console.log(`⚠️ Saltando archivo ${file} y continuando...`)
     }
   }
 
@@ -93,7 +175,14 @@ async function renamePDFsInFolder(folderPath) {
   }
 }
 
-// Ejecutar en cada carpeta
+// Ejecutar en cada carpeta con manejo de errores
 for (const folder of folders) {
-  renamePDFsInFolder(folder)
+  try {
+    console.log(`\n🔄 Procesando carpeta: ${folder}`)
+    await renamePDFsInFolder(folder)
+    console.log(`✅ Completado: ${folder}`)
+  } catch (error) {
+    console.error(`❌ Error procesando carpeta ${folder}:`, error.message)
+    console.log(`⚠️ Continuando con la siguiente carpeta...`)
+  }
 }
