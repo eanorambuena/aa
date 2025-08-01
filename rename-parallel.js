@@ -50,7 +50,10 @@ function extractIdentifier(text) {
 async function extractTextWithPDFJS(pdfPath) {
   try {
     const data = new Uint8Array(fs.readFileSync(pdfPath))
+    const consoleLog = console.log
+    console.log = () => {} // Silenciar logs de PDF.js para evitar ruido
     const pdf = await getDocument({ data }).promise
+    console.log = consoleLog // Restaurar logs
 
     let fullText = ''
     for (let i = 1; i <= pdf.numPages; i++) {
@@ -120,8 +123,8 @@ async function processFile(filePath) {
     let extractedText = await extractTextWithPDFJS(filePath)
     let identifier = extractIdentifier(extractedText)
     
-    // Si PDF.js no encuentra texto, usar OCR como fallback
-    if (!identifier && extractedText.trim().length < 50) {
+    // Si PDF.js no encuentra RUT válido, usar OCR como fallback
+    if (!identifier) {
       try {
         extractedText = await extractTextWithOCR(filePath)
         identifier = extractIdentifier(extractedText)
